@@ -23,7 +23,20 @@ from util.visualizer import Visualizer
 from util import html,util
 from util.visualizer import save_images
 
+from skimage.metrics import peak_signal_noise_ratio as psnr
+from skimage.metrics import mean_squared_error as mse
+import copy
+
 def train(cfg):
+    # train vs. test
+    cfg_test = copy.deepcopy(cfg)
+    cfg_test.serial_batches = True  # disable data shuffling; comment this line if results on randomly chosen images are needed.
+    cfg_test.no_flip = True    # no flip; comment this line if results on flipped images are needed.
+    cfg_test.display_id = -1   # no visdom display; the test code saves the results to a HTML file.
+    cfg_test.phase = 'test'
+    cfg_test.isTrain = False
+    # cfg_test.batch_size = int(cfg.batch_size / max(1, cfg.NUM_GPUS))
+    
     #init
     du.init_distributed_training(cfg)
     # Set random seed from configs.
@@ -34,6 +47,11 @@ def train(cfg):
     dataset = create_dataset(cfg)  # create a dataset given cfg.dataset_mode and other options
     dataset_size = len(dataset)    # get the number of images in the dataset.
     print('The number of training images = %d' % dataset_size)
+    
+    #test dataset
+    dataset_test = create_dataset(cfg_test)  # create a dataset given cfg.dataset_mode and other options
+    dataset_test_size = len(dataset_test)    # get the number of images in the dataset.
+    print('The number of testing images = %d' % dataset_test_size)
 
     model = create_model(cfg)      # create a model given cfg.model and other options
     model.setup(cfg)               # regular setup: load and print networks; create schedulers
@@ -82,12 +100,118 @@ def train(cfg):
             model.save_networks('latest')
             if cfg.save_iter_model and epoch>=80:
                 model.save_networks(epoch)
+                
+        if epoch % cfg.eval_epoch_freq == 0 and is_master:
+            print('evalating the model at iters %d' % epoch)
+            evaluate(cfg_test, model, dataset_test, epoch)
+            
         if is_master:
             print('End of epoch %d / %d \t Time Taken: %d sec' % (epoch, cfg.niter + cfg.niter_decay, time.time() - epoch_start_time))
         model.update_learning_rate()                     # update learning rates at the end of every epoch.
+        
+def evaluate(cfg, model, test_dataset, epoch):
+    model.eval()
+    
+    eval_path = os.path.join(cfg.checkpoints_dir, cfg.name, 'Eval.txt')
+    eval_results_fstr = open(eval_path, 'a')
+    eval_results = {'mse': [], 'psnr': [], 'mse_fg': [], 'psnr_fg': []}
+    # datasets = ['HCOCO','HAdobe5k','HFlickr','Hday2night','IHD']
+    
+    for i, data in enumerate(test_dataset):
+        model.set_input(data)  # unpack data from data loader
+        model.test()  # inference
+        with torch.no_grad():
+            model.isTrain = False
+            model.forward()
+            model.compute_visuals()
+        visuals = model.get_current_visuals(isTrain=False)  # get image results
 
+        output = visuals['out_bg']
+        real = visuals['real']
+        output_fg = visuals['out_fg']
+        
+        # comp = visuals['comp']
+        for i_img in range(real.size(0)):
+            gt, pred, pred_fg = real[i_img:i_img+1], output[i_img:i_img+1], output_fg[i_img:i_img+1]
+            mse_score_op = mse(util.tensor2im(pred), util.tensor2im(gt))
+            psnr_score_op = psnr(util.tensor2im(gt), util.tensor2im(pred), data_range=255)
+            
+            # update calculator
+            eval_results['mse'].append(mse_score_op)
+            eval_results['psnr'].append(psnr_score_op)
+            
+            mse_score_op = mse(util.tensor2im(pred_fg), util.tensor2im(gt))
+            psnr_score_op = psnr(util.tensor2im(gt), util.tensor2im(pred_fg), data_range=255)
+            
+            eval_results['mse_fg'].append(mse_score_op)
+            eval_results['psnr_fg'].append(psnr_score_op)
+            # eval_results['mask'].append(data['mask'][i_img].mean().item())
+        
+        # if i + 1 % 100 == 0:
+        #     # print('%d images have been processed' % (i + 1))
+        #     eval_results_fstr.flush()
+    all_mse, all_psnr = calculateMean(eval_results['mse']), calculateMean(eval_results['psnr'])
+    all_mse_fg, all_psnr_fg = calculateMean(eval_results['mse_fg']), calculateMean(eval_results['psnr_fg'])
+    eval_results_fstr.writelines('EPOCH: %d, MSE: %.3f, PSNR: %.3f\n' % (epoch, all_mse, all_psnr))
+    eval_results_fstr.writelines('EPOCH: %d, MSE_FG: %.3f, PSNR_FG: %.3f\n' % (epoch, all_mse_fg, all_psnr_fg))
+    eval_results_fstr.flush()
+    eval_results_fstr.close()
+
+    print('MSE:%.3f, PSNR:%.3f' % (all_mse, all_psnr))
+    print('MSE_FG:%.3f, PSNR_FG:%.3f' % (all_mse_fg, all_psnr_fg))
+    model.isTrain = True
+    
+def calculateMean(vars):
+    return sum(vars) / len(vars)
 
 def test(cfg):
+    dataset = create_dataset(cfg)  # create a dataset given cfg.dataset_mode and other options
+    model = create_model(cfg)      # create a model given cfg.model and other options
+    model.setup(cfg)               # regular setup: load and print networks; create schedulers
+
+    # create a website
+    web_dir = os.path.join(cfg.results_dir, cfg.name, '%s_%s' % (cfg.phase, cfg.epoch))  # define the website directory
+    webpage = html.HTML(web_dir, 'Experiment = %s, Phase = %s, Epoch = %s' % (cfg.name, cfg.phase, cfg.epoch))
+    # test with eval mode. This only affects layers like batchnorm and dropout.
+    # For [pix2pix]: we use batchnorm and dropout in the original pix2pix. You can experiment it with and without eval() mode.
+    # For [CycleGAN]: It should not affect CycleGAN as CycleGAN uses instancenorm without dropout.
+    if cfg.eval:
+        model.eval()
+    ismaster = du.is_master_proc(cfg.NUM_GPUS)
+
+    fmse_score_list = []
+    mse_scores = 0
+    fmse_scores = 0
+    num_image = 0
+    infer_time_total = 0
+    for i, data in enumerate(dataset):
+        model.set_input(data)  # unpack data from data loader
+        inference_start_time = time.time()
+        model.test()           # run inference
+        infer_time_total += time.time() - inference_start_time # time per batch
+        visuals = model.get_current_visuals(isTrain=False)  # get image results
+        img_path = model.get_image_paths()     # get image paths # Added by Mia
+        # img_path = dataset.dataset.image_paths     # get image paths # Added by Mia
+        if i % 5 == 0 and ismaster:  # save images to an HTML file
+            print('processing (%.4f)-th image... %s' % (i, img_path))
+        visuals_ones = OrderedDict()
+        harmonized = None
+        real = None
+        for j in range(len(img_path)):
+            img_path_one = []
+            for label, im_data in visuals.items():
+                visuals_ones[label] = im_data[j:j+1, :, :, :]
+            img_path_one.append(img_path[j])
+            save_images(webpage, visuals_ones, img_path_one, aspect_ratio=cfg.aspect_ratio, width=cfg.display_winsize)
+            num_image += 1
+            visuals_ones.clear()
+    if ismaster:
+        print('Inference Time Taken: %.4f sec' % (infer_time_total/len(dataset)/cfg.batch_size)) #divide by #batch and #img in batch
+
+    webpage.save()  # save the HTML
+
+
+def test_cfg(cfg):
     dataset = create_dataset(cfg)  # create a dataset given cfg.dataset_mode and other options
     model = create_model(cfg)      # create a model given cfg.model and other options
     model.setup(cfg)               # regular setup: load and print networks; create schedulers
@@ -110,8 +234,8 @@ def test(cfg):
         model.set_input(data)  # unpack data from data loader
         model.test()           # run inference
         visuals = model.get_current_visuals(isTrain=False)  # get image results
-        # img_path = model.get_image_paths()     # get image paths # Added by Mia
-        img_path = dataset.dataset.image_paths     # get image paths # Added by Mia
+        img_path = model.get_image_paths()     # get image paths # Added by Mia
+        # img_path = dataset.dataset.image_paths     # get image paths # Added by Mia
         if i % 5 == 0 and ismaster:  # save images to an HTML file
             print('processing (%04d)-th image... %s' % (i, img_path))
         visuals_ones = OrderedDict()
@@ -127,5 +251,3 @@ def test(cfg):
             visuals_ones.clear()
 
     webpage.save()  # save the HTML
-
-

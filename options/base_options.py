@@ -52,22 +52,10 @@ class BaseOptions():
         parser.add_argument('--suffix', default='', type=str, help='customized suffix: opt.name = opt.name + suffix: e.g., {model}_{netG}_size{load_size}')
 
         parser.add_argument('--n_downsample', type=int, default=3, help='min 2')
-        parser.add_argument('--enc_n_res', type=int, default=1, help='reflectance encoder resblock layers')
+        parser.add_argument('--enc_n_res', type=int, default=0, help='reflectance encoder resblock layers')
         parser.add_argument('--dec_n_res', type=int, default=0, help='reflectance decoder resblock layers')
         parser.add_argument('--pad_type', type=str, default='reflect', help='pad_type')
         parser.add_argument('--activ', type=str, default='lrelu', help='activ')
-
-        parser.add_argument('--light_mlp_dim', type=int, default=8, help='light dimensions')
-        parser.add_argument('--illumination_n_res', type=int, default=4, help='light transfer layers')
-
-        parser.add_argument('--inharmonyfree_norm', type=str, default='ln', help='inharmonyfree encoder norm type')
-        parser.add_argument('--ifm_n_res', type=int, default=0, help='inharmonyfree resblock layers')
-        parser.add_argument('--inharmonyfree_embed_layers', type=int, default=2, help='inharmonyfree block layers')
-        parser.add_argument('--lamda', type=int, default=10, help='lamda')
-        parser.add_argument('--loss_RH', action='store_true', help='whether saves model by iteration')
-        parser.add_argument('--loss_IS', action='store_true', help='whether saves model by iteration')
-        parser.add_argument('--loss_IH', action='store_true', help='whether saves model by iteration')
-
 
         parser.add_argument('--local_rank', type=int, default=-1, help='number of GPUs to use')
         parser.add_argument('--init_method', type=str, default='tcp://127.0.0.1:', help='process port')
@@ -77,8 +65,8 @@ class BaseOptions():
         parser.add_argument('--DIST_BACKEND', type=str, default='nccl', help='DIST_BACKEND')
         parser.add_argument('--RNG_SEED', type=int, default=1, help='NUM_SHARDS')
         
-        parser.add_argument("--spatial_code_ch", default=8, type=int)
-        parser.add_argument("--global_code_ch", default=1024, type=int)
+        parser.add_argument("--spatial_code_ch", default=512, type=int)
+        parser.add_argument("--global_code_ch", default=512, type=int)
 
         self.initialized = True
         return parser
